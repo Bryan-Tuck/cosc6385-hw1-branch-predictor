@@ -1,6 +1,7 @@
 # COSC 6385 Assignment 1: Pentium M style hybrid branch predictor
 
 Bryan E. Tuck, University of Houston, Fall 2026 (Prof. Weidong Shi).
+Repository: https://github.com/Bryan-Tuck/cosc6385-hw1-branch-predictor
 
 `src/my_predictor.h` implements `pm_predictor`, a hybrid of a 4096-entry bimodal
 table and a 4-way, 512-set, tagged global predictor indexed by the branch address
