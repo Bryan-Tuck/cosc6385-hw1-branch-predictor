@@ -1,0 +1,18 @@
+# build outputs
+src/predict
+src/predict_extra_credit
+src/compress/ct
+*.o
+
+# traces are not part of the submission
+traces/
+
+# LaTeX intermediates
+report/*.aux
+report/*.bbl
+report/*.blg
+report/*.log
+report/*.out
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz

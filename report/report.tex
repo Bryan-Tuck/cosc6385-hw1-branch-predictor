@@ -1,0 +1,191 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc}
+\usepackage[numbers]{natbib}
+\setlength{\bibsep}{3pt}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Assignment 1: A Pentium M style hybrid branch predictor\\
+  \large COSC 6385 Computer Architecture, Fall 2026}
+\author{Bryan E. Tuck\\University of Houston}
+\date{October 2026}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+The Pentium M predicts branch direction with a bimodal table, a global predictor and a loop
+predictor \cite{uzelac2009}. This assignment covers the first two. The bimodal table of 2-bit
+counters, indexed by the branch address, holds each branch's usual direction. The global
+predictor, a set-associative table of tagged 2-bit counters, holds directions that depend on
+the path taken to the branch. The Pentium M indexes it with the branch address XORed with a
+path information register (PIR). The assignment does not require the PIR, so my predictor,
+like its Appendix~B example, XORs the address with a global history register (GHR) of
+conditional branch outcomes instead. When a set holds an entry whose tag matches, the global counter is
+used; otherwise the bimodal counter is used and the global predictor allocates an entry for
+the next encounter.
+
+I implemented this hybrid as the \code{pm\_predictor} class of \code{my\_predictor.h} in the CBP2
+branch prediction infrastructure \cite{jimenez2006}, following the structure and the worked
+example in the assignment \cite{assignment}, and measured it on the 20 CBP2 traces. It averages
+7.759 mispredictions per thousand instructions (MPKI) over the traces (Section~\ref{sec:results}).
+The loop predictor and branch target prediction are outside the assignment and are not implemented,
+and I did not attempt the extra credit \code{cpm\_predictor}. The predictor uses no third-party
+cache code.
+
+\section{Predictor design}
+
+Figure~\ref{fig:design} shows the structure the code implements. The sizes follow the assignment
+figure: a 4096-entry bimodal table, a 4-way global predictor with 512 sets, and
+$\mathrm{Index} = \mathrm{HASH}[14{:}6]$, $\mathrm{Tag} = \mathrm{HASH}[5{:}0]$. Each size is a
+\code{\#define} at the top of the \code{pm\_predictor} section of \code{my\_predictor.h}.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  >=Latex, font=\small,
+  box/.style={draw, rounded corners=1pt, minimum height=2.2em, inner sep=4pt, align=center},
+  tbl/.style={draw, minimum width=3.8em, minimum height=4em, align=center},
+]
+  \node[box] (pc) {branch address $A$};
+  \node[box, below=1.4em of pc] (ghr) {GHR $H$ (15 bits)};
+  \node[draw, circle, inner sep=1pt, right=1.8em of ghr] (xor) {$\oplus$};
+  \node[box, right=1.4em of xor] (split) {$h = A \oplus H$\\$h[14{:}6]$ = set\\$h[5{:}0]$ = tag};
+  \node[tbl, right=1.4em of split] (w0) {way 0};
+  \node[tbl, right=0.3em of w0] (w1) {way 1};
+  \node[tbl, right=0.3em of w1] (w2) {way 2};
+  \node[tbl, right=0.3em of w2] (w3) {way 3};
+  \node[above=0.3em of w1.north east] {global predictor, 512 sets, entry = V, tag, 2bc, LRU age};
+  \node[box, below=1.4em of w1.south east] (hit) {valid and tag match in some way?};
+  \node[box, below=1.2em of hit] (mux) {hit ? global counter : bimodal counter};
+  \node[tbl, minimum width=8em] (bim) at (split |- mux) {bimodal table\\4096 $\times$ 2bc};
+  \draw[->] (pc.east) -| (xor.north);
+  \draw[->] (ghr) -- (xor);
+  \draw[->] (xor) -- (split);
+  \draw[->] (split) -- (w0) node[midway, above, font=\scriptsize] {set};
+  \draw[->] (pc.west) -- ++(-1.0em,0) |- (bim.west) node[pos=0.75, above, font=\scriptsize] {$A[11{:}0]$};
+  \draw[->] (w1.south east) -- (hit.north) node[midway, right, font=\scriptsize] {4 tags, 4 counters};
+  \draw[->] (hit) -- (mux);
+  \draw[->] (bim.east) -- (mux.west);
+  \draw[->] (mux.east) -- ++(1.4em,0) node[right] {prediction};
+\end{tikzpicture}
+\caption{Structure of \code{pm\_predictor}. The hash $h$ of the branch address and the global
+history register selects a set of the 4-way global predictor and supplies the tag; the bimodal
+table is indexed by the low address bits. A tag hit selects the global prediction, a miss
+selects the bimodal prediction.}
+\label{fig:design}
+\end{figure}
+
+\subsection{Bimodal table}
+
+The bimodal table holds $2^{12} = 4096$ saturating 2-bit counters. For a conditional branch at
+address $A$ the counter index is the low 12 bits,
+%
+\begin{equation}
+  i_{\mathrm{bim}} = A \bmod 2^{12},
+\end{equation}
+%
+and the prediction is the counter's upper bit (states 2 and 3 predict taken). The counters
+start at 0. The index is $\mathrm{IP}[11{:}0]$, as in the assignment figure. The Appendix~B
+example drops the two low bits of its word-aligned addresses, but x86 branch instructions can
+start at any byte, so the index keeps bits [1:0].
+
+\subsection{Global predictor}
+
+The global predictor has four ways of 512 sets. Each entry, a \code{pm\_global\_entry} in the
+code, stores a valid bit, a 6-bit tag, a 2-bit counter and a 2-bit LRU age. The global history
+register $H$ holds the outcomes of the last 15 conditional branches, newest in bit 0. The lookup
+hashes the address with the history and splits the hash into a set index and a tag:
+%
+\begin{align}
+  h &= (A \oplus H) \bmod 2^{15}, \\
+  s &= \lfloor h / 2^{6} \rfloor = h[14{:}6], \qquad t = h \bmod 2^{6} = h[5{:}0].
+\end{align}
+%
+The upper hash bits select the set and the lower bits form the tag, following the labels
+$\mathrm{Index} = \mathrm{HASH}[14{:}6]$ and $\mathrm{Tag} = \mathrm{HASH}[5{:}0]$ in the
+assignment figure and the row/tag split of its Appendix~B example, where a 4-bit hash gives the
+row from bits [3:2] and the tag from bits [1:0]. Because the 15-bit history covers the whole
+hash, the tag depends on the six most recent outcomes XORed with address bits [5:0], and the
+set index on the older nine outcomes XORed with address bits [14:6].
+
+The lookup compares $t$ with the tag of each valid way in set $s$. A match is a hit and the
+global prediction is the upper bit of that way's counter. On a miss the lookup records the LRU way of the set
+(age $= 3$) as the victim for allocation. Replacement is true LRU kept with per-entry ages. When
+a way is used, every way of the set whose age was smaller than the used way's age grows by one
+and the used way's age becomes 0. In the constructor, way $w$ gets age $3 - w$, so an empty set
+fills way 0, 1, 2, 3 in that order and no valid entry is evicted while an invalid way remains.
+For two ways the age is a single bit that is 1 in the LRU way, which is the LRU column of the
+Appendix~B tables.
+
+\subsection{Selection and update}
+
+The final prediction is the global prediction on a hit and the bimodal prediction on a miss.
+There is no chooser table; the tag comparison selects the table. The predictor returns a
+\code{pm\_update} object that records the bimodal index, the set, the tag, the hit flag and the
+way, so \code{update} does not repeat the lookup.
+
+After the driver reports the outcome, \code{update} changes state only for conditional branches:
+\begin{enumerate}
+  \item The bimodal counter at $i_{\mathrm{bim}}$ is trained toward the outcome whether the
+    global lookup hit or missed.
+  \item On a hit the matching global counter is trained toward the outcome. On a miss the LRU
+    way is allocated. Its valid bit is set, its tag becomes $t$, and its existing counter is
+    trained toward the outcome without being reset, as in the Appendix~B example, where in
+    step 9 the evicted entry's counter 3 becomes 2 after a not-taken outcome.
+  \item The used way becomes most recently used, as described above.
+  \item The outcome is shifted into bit 0 of $H$, which is masked to 15 bits.
+\end{enumerate}
+Unconditional branches are predicted taken and do not touch the tables or the history, the same
+convention as the sample \code{gshare\_predictor} that ships with the infrastructure. Branch
+targets are not predicted; \code{predict} sets the target prediction to 0, as the starter code
+does.
+
+\section{Results}
+\label{sec:results}
+
+Each CBP2 trace holds the branches of 100 million instructions of one SPEC CPU2000 or SPECjvm98
+program. The driver counts direction mispredictions of conditional branches and reports MPKI,
+mispredictions per thousand instructions; lower is better. Table~\ref{tab:mpki} lists the
+result for every trace. The raw numbers are in \code{results/hybrid.csv}.
+
+\begin{table}[htbp]
+\centering
+\caption{MPKI of \code{pm\_predictor} per trace (lower is better).}
+\label{tab:mpki}
+\begin{tabular}{lr@{\hspace{3em}}lr}
+\toprule
+Trace & MPKI & Trace & MPKI \\
+\midrule
+164.gzip & 12.697 & 213.javac & 3.001 \\
+175.vpr & 15.969 & 222.mpegaudio & 2.932 \\
+176.gcc & 18.009 & 227.mtrt & 3.453 \\
+181.mcf & 18.269 & 228.jack & 4.239 \\
+186.crafty & 9.109 & 252.eon & 2.153 \\
+197.parser & 10.936 & 253.perlbmk & 5.095 \\
+201.compress & 8.019 & 254.gap & 4.309 \\
+202.jess & 2.005 & 255.vortex & 1.643 \\
+205.raytrace & 3.602 & 256.bzip2 & 0.115 \\
+209.db & 4.801 & 300.twolf & 24.821 \\
+\midrule
+\multicolumn{3}{l}{Average over the 20 traces} & 7.759 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+MPKI ranges from 0.115 on bzip2 to 24.821 on twolf. The four highest, twolf, mcf, gcc and vpr,
+are all SPECint programs.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}
